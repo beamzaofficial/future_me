@@ -1,0 +1,81 @@
+rules_version = '2';
+
+// Future Me — Firestore security rules
+//
+// Data model:
+//   /letters/{letterId}
+//     authorId      string  (uid of creator — immutable)
+//     authorName    string
+//     authorPhotoUrl  string|null
+//     title         string
+//     content       string
+//     createdAt     timestamp
+//     unlockAt      timestamp
+//     isPublic      bool
+//     reactions     map<uid, reactionKey>   (each user can set their own key only)
+//
+// Privacy guarantees:
+//  * A locked letter can only be read by its author, regardless of isPublic.
+//  * A public letter is readable by anyone after unlockAt has passed.
+//  * Only the author can update or delete their own letter, and only before unlock.
+//  * Any signed-in user may add/remove their OWN reaction on a public, unlocked letter,
+//    but cannot modify any other field or another user's reaction.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /letters/{letterId} {
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isAuthor() {
+        return isSignedIn() && request.auth.uid == resource.data.authorId;
+      }
+
+      function isUnlocked() {
+        return resource.data.unlockAt <= request.time;
+      }
+
+      function isPublicAndUnlocked() {
+        return resource.data.isPublic == true && isUnlocked();
+      }
+
+      // READ
+      allow get, list: if isAuthor() || isPublicAndUnlocked();
+
+      // CREATE — author must be the requester, unlockAt in the future, content non-empty
+      allow create: if isSignedIn()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.unlockAt is timestamp
+        && request.resource.data.unlockAt > request.time
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 200
+        && request.resource.data.content is string
+        && request.resource.data.content.size() > 0
+        && request.resource.data.content.size() <= 5000
+        && request.resource.data.isPublic is bool;
+
+      // UPDATE — author can edit only while still locked; or any signed-in user can change
+      // ONLY their own entry inside reactions on a public+unlocked letter.
+      allow update: if (isAuthor() && !isUnlocked()
+                       && request.resource.data.authorId == resource.data.authorId
+                       && request.resource.data.createdAt == resource.data.createdAt)
+                    || (isSignedIn() && isPublicAndUnlocked()
+                       && onlyReactionMineChanged());
+
+      function onlyReactionMineChanged() {
+        // The diff must affect ONLY the reactions map, and inside reactions only the
+        // requesting user's own key.
+        return request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['reactions'])
+            && request.resource.data.reactions.diff(resource.data.reactions)
+                  .affectedKeys().hasOnly([request.auth.uid]);
+      }
+
+      // DELETE — only author, only while still locked
+      allow delete: if isAuthor() && !isUnlocked();
+    }
+  }
+}
